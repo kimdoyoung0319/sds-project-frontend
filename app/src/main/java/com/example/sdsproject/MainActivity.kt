@@ -48,6 +48,7 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.autofill.ContentType
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.drawBehind
 import androidx.compose.ui.draw.rotate
@@ -99,8 +100,11 @@ import kotlinx.coroutines.withContext
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.serializer
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
+import kotlinx.serialization.json.put
+import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody
@@ -143,109 +147,13 @@ interface UserInfoRepository {
     suspend fun getUserProfileImageUri(): String
 }
 
-class NidUserInfoRepository(private val context: Context) : UserInfoRepository {
-    private val deferredProfile: Deferred<NidProfile> by lazy {
-        CoroutineScope(Dispatchers.IO).async { fetchUserProfile() }
-    }
-
-    init {
-        NidOAuth.initialize(
-            context = context,
-            clientId = "mZgJxaEMILClmQ4Z9Z4n",
-            clientSecret = "lGnr0KNcb8",
-            clientName = "테스트 어플리케이션",
-        )
-        NidOAuth.behavior = LoginBehavior.DEFAULT
-    }
-
-    private suspend fun fetchUserProfile(): NidProfile =
-        suspendCoroutine<NidProfile> { continuation ->
-            val callback = object : NidProfileCallback<NidProfile> {
-                override fun onSuccess(result: NidProfile) {
-                    continuation.resume(result)
-                }
-
-                override fun onFailure(errorCode: String, errorDesc: String) {
-                    continuation.resumeWithException(Exception("$errorCode:$errorDesc"))
-                }
-            }
-
-            NidOAuth.getUserProfile(callback)
-        }
-
-    suspend fun loginViaNaver(): Pair<Boolean, String> = suspendCoroutine { continuation ->
-        val callback = object : NidOAuthCallback {
-            override fun onSuccess() =
-                continuation.resume(Pair(true, "네이버를 통한 로그인에 성공하였습니다."))
-
-            override fun onFailure(errorCode: String, errorDesc: String) =
-                continuation.resume(
-                    Pair(false, "네이버를 통한 로그인에 실패하였습니다: $errorDesc")
-                )
-        }
-
-        NidOAuth.requestLogin(context, callback)
-    }
-
-    override suspend fun getUserName(): String = deferredProfile.await().profile.name
-    override suspend fun getUserPhoneNumber(): String = deferredProfile.await().profile.mobile
-    override suspend fun getUserEmail(): String = deferredProfile.await().profile.email
-    override suspend fun getUserProfileImageUri(): String =
-        deferredProfile.await().profile.profileImage
-}
-
-@Serializable
-data class Token(val token: String? = null)
-
-object TokenSerializer : Serializer<Token> {
-    override val defaultValue = Token()
-
-    override suspend fun readFrom(input: InputStream): Token =
-        Json.decodeFromString(input.readBytes().decodeToString())
-
-    override suspend fun writeTo(t: Token, output: OutputStream) =
-        output.write(Json.encodeToString(Token.serializer(), t).encodeToByteArray())
-}
-
-fun createTokenDataStore(context: Context): DataStore<Token> {
-    AeadConfig.register()
-
-    val handle = AndroidKeysetManager.Builder()
-        .withSharedPref(context, "keyset", "keyset_prefs")
-        .withKeyTemplate(KeyTemplate.createFrom(PredefinedAeadParameters.AES256_GCM))
-        .withMasterKeyUri("android-keystore://master_key")
-        .build()
-        .keysetHandle
-
-    val serializer = AeadSerializer(
-        aead = handle.getPrimitive(RegistryConfiguration.get(), Aead::class.java),
-        wrappedSerializer = TokenSerializer,
-        associatedData = "token.json".encodeToByteArray()
-    )
-
-    return DataStoreFactory.create(
-        serializer = serializer,
-        produceFile = { context.dataDir.resolve("datastore/token.json") })
-}
-
-class TokenRepository(private val dataStore: DataStore<Token>) {
-    val token: Flow<String?> = dataStore.data.map { it.token }
-
-    suspend fun saveToken(token: String) {
-        dataStore.updateData { it.copy(token = token) }
-    }
-
-    suspend fun clearToken() {
-        dataStore.updateData { it.copy(token = null) }
-    }
-}
 
 @Composable
 fun MainScreen(context: Context) {
     var state by remember { mutableStateOf<UiState>(UiState.Unauthenticated) }
     val coroutineScope = rememberCoroutineScope()
     val userInfoRepository = remember { NidUserInfoRepository(context) }
-    val tokenRepository = remember { TokenRepository(createTokenDataStore(context)) }
+    val tokenRepository = remember { TokenRepository(context) }
 
     Box(
         modifier = Modifier.fillMaxSize(),
@@ -257,24 +165,24 @@ fun MainScreen(context: Context) {
                     NaverLoginButton(onClick = {
                         state = UiState.Loading
                         coroutineScope.launch {
-                            val (isSuccess, message) = userInfoRepository.loginViaNaver()
+                            val oauthToken = userInfoRepository.loginViaNaver()
 
-                            if (!isSuccess) {
-                                state = UiState.Dialog(message, false)
+                            if (oauthToken == null) {
+                                state = UiState.Dialog("로그인에 실패하였습니다.", false)
                                 return@launch
                             }
 
-                            val token = fetchToken()
+                            val token = fetchToken(oauthToken)
 
                             if (token == null) {
-                                state = UiState.Dialog(
-                                    "JWT를 가져오는데 실패하였습니다.", false
-                                )
+                                state = UiState.Dialog("로그인에 실패하였습니다.", false)
                                 return@launch
                             }
 
-                            tokenRepository.saveToken(token)
-                            state = UiState.Dialog(token, true)
+                            tokenRepository.setAccessToken(token.first)
+                            tokenRepository.setRefreshToken(token.second)
+
+                            state = UiState.Dialog(token.first.value, true)
                         }
                     })
                 }
@@ -289,17 +197,21 @@ fun MainScreen(context: Context) {
                     SendRequestButton {
                         state = UiState.Loading
                         coroutineScope.launch {
-                            val token = tokenRepository.token.first()
+                            val token = tokenRepository.getAccessToken()
 
                             if (token == null) {
-                                state = UiState.Dialog("발급받은 JWT가 존재하지 않습니다.", false)
+                                state = UiState.Dialog(
+                                    "서버로부터 발급받은 토큰이 존재하지 않습니다.", false
+                                )
                                 return@launch
                             }
 
                             val message = verifyToken(token)
 
                             if (message == null) {
-                                state = UiState.Dialog("서버로부터 JWT를 검증하는데 실패하였습니다.", false)
+                                state = UiState.Dialog(
+                                    "서버로부터 토큰을 검증하는데 실패하였습니다.", false
+                                )
                                 return@launch
                             }
 
@@ -603,54 +515,5 @@ fun UserInfoCardPreview() {
         override suspend fun getUserProfileImageUri(): String = ""
     }
     UserInfoCard(repository)
-}
-
-suspend fun fetchToken(): String? {
-    return withContext(Dispatchers.IO) {
-        try {
-            val client = OkHttpClient.Builder()
-                .connectTimeout(10, TimeUnit.SECONDS)
-                .readTimeout(10, TimeUnit.SECONDS)
-                .build()
-
-            val request = Request.Builder()
-                .url("http://10.0.2.2:3000/auth/login")
-                .post("".toRequestBody())
-                .build()
-
-            val response = client.newCall(request).execute()
-            val body = response.body?.string() ?: ""
-            val json = Json.parseToJsonElement(body).jsonObject
-
-            json["token"]?.jsonPrimitive?.content
-        } catch (_: Exception) {
-            null
-        }
-    }
-}
-
-suspend fun verifyToken(token: String): String? {
-    return withContext(Dispatchers.IO) {
-        try {
-            val client = OkHttpClient.Builder()
-                .connectTimeout(10, TimeUnit.SECONDS)
-                .readTimeout(10, TimeUnit.SECONDS)
-                .build()
-
-            val request = Request.Builder()
-                .url("http://10.0.2.2:3000/me")
-                .get()
-                .header("Authorization", "Bearer $token")
-                .build()
-
-            val response = client.newCall(request).execute()
-            val body = response.body?.string() ?: ""
-            val json = Json.parseToJsonElement(body).jsonObject
-
-            json["message"]?.jsonPrimitive?.content
-        } catch (_: Exception) {
-            null
-        }
-    }
 }
 
