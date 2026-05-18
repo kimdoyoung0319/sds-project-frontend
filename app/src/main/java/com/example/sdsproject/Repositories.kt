@@ -11,22 +11,17 @@ import com.google.crypto.tink.RegistryConfiguration
 import com.google.crypto.tink.aead.AeadConfig
 import com.google.crypto.tink.aead.PredefinedAeadParameters
 import com.google.crypto.tink.integration.android.AndroidKeysetManager
-import com.navercorp.nid.NidOAuth
-import com.navercorp.nid.oauth.domain.enum.LoginBehavior
-import com.navercorp.nid.oauth.util.NidOAuthCallback
-import com.navercorp.nid.profile.domain.vo.NidProfile
-import com.navercorp.nid.profile.util.NidProfileCallback
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Deferred
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.async
 import kotlinx.coroutines.flow.first
+import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
 import java.io.InputStream
 import java.io.OutputStream
-import kotlin.coroutines.resume
-import kotlin.coroutines.resumeWithException
-import kotlin.coroutines.suspendCoroutine
+
+@Serializable
+data class Token(val value: String)
+
+@Serializable
+data class TokenPair(val accessToken: Token, val refreshToken: Token)
 
 class TokenRepository(context: Context) {
     private val accessTokenStore: DataStore<Token?>
@@ -82,59 +77,4 @@ class TokenRepository(context: Context) {
         refreshTokenStore.updateData {
             it?.copy(value = token.value) ?: token
         }
-}
-
-class NidUserInfoRepository(private val context: Context) : UserInfoRepository {
-    private val deferredProfile: Deferred<NidProfile> by lazy {
-        CoroutineScope(Dispatchers.IO).async { fetchUserProfile() }
-    }
-
-    init {
-        NidOAuth.initialize(
-            context = context,
-            clientId = "mZgJxaEMILClmQ4Z9Z4n",
-            clientSecret = "lGnr0KNcb8",
-            clientName = "테스트 어플리케이션",
-        )
-        NidOAuth.behavior = LoginBehavior.DEFAULT
-    }
-
-    private suspend fun fetchUserProfile(): NidProfile =
-        suspendCoroutine<NidProfile> { continuation ->
-            val callback = object : NidProfileCallback<NidProfile> {
-                override fun onSuccess(result: NidProfile) {
-                    continuation.resume(result)
-                }
-
-                override fun onFailure(errorCode: String, errorDesc: String) {
-                    continuation.resumeWithException(Exception("$errorCode:$errorDesc"))
-                }
-            }
-
-            NidOAuth.getUserProfile(callback)
-        }
-
-    suspend fun loginViaNaver(): OAuthToken? = suspendCoroutine { continuation ->
-        val callback = object : NidOAuthCallback {
-            override fun onSuccess() {
-                val token = NidOAuth.getAccessToken()
-
-                if (token == null)
-                    continuation.resume(null)
-                else
-                    continuation.resume(OAuthToken(token, OAuthProvider.Naver))
-            }
-
-            override fun onFailure(errorCode: String, errorDesc: String) =
-                continuation.resume(null)
-        }
-
-        NidOAuth.requestLogin(context, callback)
-    }
-
-    override suspend fun getUserName(): String = deferredProfile.await().profile.name
-    override suspend fun getUserPhoneNumber(): String = deferredProfile.await().profile.mobile
-    override suspend fun getUserEmail(): String = deferredProfile.await().profile.email
-    override suspend fun getUserProfileImageUri(): String =
-        deferredProfile.await().profile.profileImage
 }

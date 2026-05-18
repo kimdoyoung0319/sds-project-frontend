@@ -2,9 +2,11 @@ package com.example.sdsproject
 
 import android.content.Context
 import android.os.Bundle
+import android.content.Intent
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import androidx.browser.customtabs.CustomTabsIntent
 import androidx.compose.animation.core.LinearEasing
 import androidx.compose.animation.core.animateFloat
 import androidx.compose.animation.core.infiniteRepeatable
@@ -48,7 +50,6 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.autofill.ContentType
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.drawBehind
 import androidx.compose.ui.draw.rotate
@@ -67,56 +68,36 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
-import androidx.datastore.core.DataStore
-import androidx.datastore.core.DataStoreFactory
-import androidx.datastore.core.Serializer
-import androidx.datastore.dataStore
-import androidx.datastore.tink.AeadSerializer
+import androidx.core.net.toUri
 import coil3.compose.AsyncImage
 import coil3.request.ImageRequest
 import com.example.sdsproject.ui.theme.PostechRed
 import com.example.sdsproject.ui.theme.PostechRedLight
 import com.example.sdsproject.ui.theme.SDSProjectTheme
-import com.google.crypto.tink.Aead
-import com.google.crypto.tink.KeyTemplate
-import com.google.crypto.tink.RegistryConfiguration
-import com.google.crypto.tink.aead.AeadConfig
-import com.google.crypto.tink.aead.PredefinedAeadParameters
-import com.google.crypto.tink.integration.android.AndroidKeysetManager
-import com.navercorp.nid.NidOAuth
-import com.navercorp.nid.oauth.domain.enum.LoginBehavior
-import com.navercorp.nid.oauth.util.NidOAuthCallback
-import com.navercorp.nid.profile.domain.vo.NidProfile
-import com.navercorp.nid.profile.util.NidProfileCallback
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Deferred
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.async
-import kotlinx.coroutines.flow.Flow
-import kotlinx.coroutines.flow.first
-import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
-import kotlinx.serialization.Serializable
-import kotlinx.serialization.serializer
-import kotlinx.serialization.json.Json
-import kotlinx.serialization.json.buildJsonObject
-import kotlinx.serialization.json.jsonObject
-import kotlinx.serialization.json.jsonPrimitive
-import kotlinx.serialization.json.put
-import okhttp3.MediaType.Companion.toMediaType
-import okhttp3.OkHttpClient
-import okhttp3.Request
-import okhttp3.RequestBody
-import okhttp3.RequestBody.Companion.toRequestBody
-import java.io.InputStream
-import java.io.OutputStream
-import java.util.concurrent.TimeUnit
-import kotlin.coroutines.resume
-import kotlin.coroutines.resumeWithException
-import kotlin.coroutines.suspendCoroutine
+import android.net.Uri
+import okhttp3.HttpUrl
 
 class MainActivity : ComponentActivity() {
+    private var authResultDeferred: CompletableDeferred<Uri>? = null
+
+    private suspend fun onAuthorize(url: HttpUrl): Uri {
+        val deferred = CompletableDeferred<Uri>()
+
+        authResultDeferred = deferred
+
+        val customTabsIntent = CustomTabsIntent.Builder().build()
+        customTabsIntent.launchUrl(this, url.toString().toUri())
+
+        return deferred.await()
+    }
+
+    private fun validateRedirectUrl(redirectUrl: Uri?): Boolean =
+        redirectUrl != null
+                && redirectUrl.scheme == "com.example.sdsproject"
+                && redirectUrl.host == "oauth2callback"
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
@@ -126,34 +107,38 @@ class MainActivity : ComponentActivity() {
                     modifier = Modifier.fillMaxSize(),
                     color = MaterialTheme.colorScheme.background,
                 ) {
-                    MainScreen(this)
+                    MainScreen(this, ::onAuthorize)
                 }
             }
         }
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+
+        val redirectUrl = intent.data
+
+        if (!validateRedirectUrl(redirectUrl))
+            return
+
+        authResultDeferred?.complete(redirectUrl!!)
     }
 }
 
 sealed class UiState {
     data object Unauthenticated : UiState()
-    data object Authenticated : UiState()
+    data class Authenticating(val provider: AuthProvider) : UiState()
+    data class Authenticated(val userInfo: UserInfo) : UiState()
     data object Loading : UiState()
     data class Dialog(val body: String, val isSuccess: Boolean) : UiState()
 }
 
-interface UserInfoRepository {
-    suspend fun getUserName(): String
-    suspend fun getUserEmail(): String
-    suspend fun getUserPhoneNumber(): String
-    suspend fun getUserProfileImageUri(): String
-}
-
-
 @Composable
-fun MainScreen(context: Context) {
+fun MainScreen(context: Context, onAuthorize: suspend (HttpUrl) -> Uri) {
     var state by remember { mutableStateOf<UiState>(UiState.Unauthenticated) }
     val coroutineScope = rememberCoroutineScope()
-    val userInfoRepository = remember { NidUserInfoRepository(context) }
     val tokenRepository = remember { TokenRepository(context) }
+    val authManager = remember { AuthManager(tokenRepository) }
 
     Box(
         modifier = Modifier.fillMaxSize(),
@@ -163,62 +148,33 @@ fun MainScreen(context: Context) {
             is UiState.Unauthenticated -> {
                 Column(verticalArrangement = Arrangement.spacedBy(16.dp)) {
                     NaverLoginButton(onClick = {
-                        state = UiState.Loading
-                        coroutineScope.launch {
-                            val oauthToken = userInfoRepository.loginViaNaver()
-
-                            if (oauthToken == null) {
-                                state = UiState.Dialog("로그인에 실패하였습니다.", false)
-                                return@launch
-                            }
-
-                            val token = fetchToken(oauthToken)
-
-                            if (token == null) {
-                                state = UiState.Dialog("로그인에 실패하였습니다.", false)
-                                return@launch
-                            }
-
-                            tokenRepository.setAccessToken(token.first)
-                            tokenRepository.setRefreshToken(token.second)
-
-                            state = UiState.Dialog(token.first.value, true)
-                        }
+                        state = UiState.Authenticating(AuthProvider.Naver)
                     })
                 }
             }
 
-            is UiState.Authenticated -> {
-                Column(
-                    verticalArrangement = Arrangement.spacedBy(16.dp),
-                    horizontalAlignment = Alignment.CenterHorizontally
-                ) {
-                    UserInfoCard(userInfoRepository)
-                    SendRequestButton {
-                        state = UiState.Loading
-                        coroutineScope.launch {
-                            val token = tokenRepository.getAccessToken()
+            is UiState.Authenticating -> {
+                LaunchedEffect(currentState) {
+                    coroutineScope.launch {
+                        try {
+                            authManager.authorize(currentState.provider, onAuthorize)
 
-                            if (token == null) {
-                                state = UiState.Dialog(
-                                    "서버로부터 발급받은 토큰이 존재하지 않습니다.", false
-                                )
-                                return@launch
-                            }
+                            if (authManager.state !is AuthState.Authenticated)
+                                throw IllegalStateException()
 
-                            val message = verifyToken(token)
+                            val userInfo =
+                                authManager.fetchUserInfo() ?: throw IllegalStateException()
 
-                            if (message == null) {
-                                state = UiState.Dialog(
-                                    "서버로부터 토큰을 검증하는데 실패하였습니다.", false
-                                )
-                                return@launch
-                            }
-
-                            state = UiState.Dialog(message, true)
+                            state = UiState.Authenticated(userInfo)
+                        } catch (_: IllegalStateException) {
+                            state = UiState.Dialog("인증에 실패하였습니다.", false)
                         }
                     }
                 }
+            }
+
+            is UiState.Authenticated -> {
+                UserInfoCard(currentState.userInfo)
             }
 
             is UiState.Loading -> {
@@ -231,7 +187,7 @@ fun MainScreen(context: Context) {
                 ResponseDialog(
                     body = body,
                     isSuccess = isSuccess,
-                    onClose = { state = UiState.Authenticated }
+                    onClose = { state = UiState.Unauthenticated }
                 )
             }
         }
@@ -430,19 +386,7 @@ fun ResponseDialog(body: String, isSuccess: Boolean, onClose: () -> Unit) {
 }
 
 @Composable
-fun UserInfoCard(repository: UserInfoRepository) {
-    var userName by remember { mutableStateOf("") }
-    var userEmail by remember { mutableStateOf("") }
-    var userPhoneNumber by remember { mutableStateOf("") }
-    var userProfileImageUri by remember { mutableStateOf("") }
-
-    LaunchedEffect(repository) {
-        userName = repository.getUserName()
-        userEmail = repository.getUserEmail()
-        userPhoneNumber = repository.getUserPhoneNumber()
-        userProfileImageUri = repository.getUserProfileImageUri()
-    }
-
+fun UserInfoCard(userInfo: UserInfo) {
     Box(contentAlignment = Alignment.Center) {
         ElevatedCard(
             elevation = CardDefaults.cardElevation(defaultElevation = 6.dp),
@@ -465,21 +409,23 @@ fun UserInfoCard(repository: UserInfoRepository) {
                     horizontalArrangement = Arrangement.spacedBy(16.dp)
                 ) {
                     val context = LocalContext.current
-                    AsyncImage(
-                        model = ImageRequest.Builder(context)
-                            .data(userProfileImageUri)
-                            .build(),
-                        contentDescription = "Profile picture",
-                        contentScale = ContentScale.Crop,
-                        modifier = Modifier
-                            .fillMaxHeight()
-                            .aspectRatio(1f)
-                            .clip(CircleShape)
-                            .border(2.dp, Color.White.copy(alpha = 0.6f), CircleShape)
-                    )
+                    if (userInfo.profileImageUrl != null) {
+                        AsyncImage(
+                            model = ImageRequest.Builder(context)
+                                .data(userInfo.profileImageUrl)
+                                .build(),
+                            contentDescription = "Profile picture",
+                            contentScale = ContentScale.Crop,
+                            modifier = Modifier
+                                .fillMaxHeight()
+                                .aspectRatio(1f)
+                                .clip(CircleShape)
+                                .border(2.dp, Color.White.copy(alpha = 0.6f), CircleShape)
+                        )
+                    }
                     Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
                         Text(
-                            text = userName,
+                            text = userInfo.name,
                             color = Color.White,
                             fontSize = 22.sp,
                             fontWeight = FontWeight.ExtraBold,
@@ -487,13 +433,13 @@ fun UserInfoCard(repository: UserInfoRepository) {
                         )
                         Spacer(modifier = Modifier.height(4.dp))
                         Text(
-                            text = userEmail,
+                            text = userInfo.email,
                             color = Color.White.copy(alpha = 0.75f),
                             fontSize = 13.sp,
                             letterSpacing = 0.2.sp,
                         )
                         Text(
-                            text = userPhoneNumber,
+                            text = userInfo.phoneNumber,
                             color = Color.White.copy(alpha = 0.75f),
                             fontSize = 13.sp,
                             letterSpacing = 0.2.sp,
@@ -503,17 +449,5 @@ fun UserInfoCard(repository: UserInfoRepository) {
             }
         }
     }
-}
-
-@Preview
-@Composable
-fun UserInfoCardPreview() {
-    val repository = object : UserInfoRepository {
-        override suspend fun getUserName(): String = "홍길동"
-        override suspend fun getUserEmail(): String = "foo@bar.com"
-        override suspend fun getUserPhoneNumber(): String = "010-1234-5678"
-        override suspend fun getUserProfileImageUri(): String = ""
-    }
-    UserInfoCard(repository)
 }
 
