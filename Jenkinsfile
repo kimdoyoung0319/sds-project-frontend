@@ -55,7 +55,6 @@ pipeline {
             steps {
                 // /frontend is bind-mounted from the host (see jenkins/start).
                 sh '''
-                    mkdir -p /frontend/deploy
                     cp app/build/outputs/apk/debug/*.apk /frontend/deploy/
                 '''
             }
