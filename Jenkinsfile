@@ -22,6 +22,7 @@ pipeline {
                         -v "${ANDROID_SDK_ROOT}:/opt/android-sdk" \
                         -w /project \
                         -e ANDROID_HOME=/opt/android-sdk \
+                        --platform linux/amd64 \
                         eclipse-temurin:21-jdk-jammy \
                         bash -c "
                             set -e
